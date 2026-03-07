@@ -1,0 +1,8 @@
+*.png
+*.log
+*.xlsx
+*.uncx
+__pycache__/
+build/
+dist/
+.venv/
