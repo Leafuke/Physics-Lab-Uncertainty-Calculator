@@ -11,6 +11,7 @@ from .models import ProjectData
 APP_ORG = "Leafuke"
 APP_NAME = "UncertaintyCalculator"
 MAX_RECENT_FILES = 10
+AUTO_UPDATE_CHECK_KEY = "updates/autoCheckEnabled"
 
 
 def app_data_dir() -> Path:
@@ -26,6 +27,19 @@ def autosave_file_path() -> Path:
 
 def settings() -> QSettings:
     return QSettings(APP_ORG, APP_NAME)
+
+
+def auto_update_check_enabled() -> bool:
+    value = settings().value(AUTO_UPDATE_CHECK_KEY, True)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off", ""}
+    return bool(value)
+
+
+def set_auto_update_check_enabled(enabled: bool) -> None:
+    settings().setValue(AUTO_UPDATE_CHECK_KEY, bool(enabled))
 
 
 def load_project_file(path: str) -> ProjectData:

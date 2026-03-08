@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import json
 import re
+from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QIcon
+from PySide6.QtCore import QEvent, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QIcon
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
+    QAbstractItemDelegate,
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -31,17 +38,19 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QTextBrowser,
     QToolBar,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from . import APP_DISPLAY_NAME, APP_VERSION
+from . import APP_DISPLAY_NAME, APP_LICENSE_NAME, APP_REPOSITORY_URL, APP_VERSION
 from .calculations import CalculationResult, calculate_project, format_number, normalize_decimal_places, rounded_measurement
 from .excel_io import export_data_to_excel, export_project_to_excel, import_measurements_from_excel
 from .models import BSource, BSourceType, ProjectData, b_source_display_name, default_divisor_for
 from .persistence import (
+    auto_update_check_enabled,
     clear_recent_files,
     last_project_path,
     load_autosave,
@@ -49,177 +58,13 @@ from .persistence import (
     push_recent_file,
     recent_files,
     save_project_file,
+    set_auto_update_check_enabled,
     set_last_project_path,
     settings,
     write_autosave,
 )
-
-
-APP_STYLE_SHEET = """
-QMainWindow {
-    background: #f3f6fb;
-}
-
-QToolBar {
-    spacing: 6px;
-    padding: 5px 8px;
-    background: #ffffff;
-    border: none;
-    border-bottom: 1px solid #d8e0ea;
-}
-
-QToolBar::separator {
-    width: 1px;
-    margin: 4px 6px;
-    background: #d8e0ea;
-}
-
-QToolButton {
-    padding: 6px 10px;
-    border-radius: 10px;
-}
-
-QToolButton:hover {
-    background: #eef4ff;
-}
-
-QMenu {
-    background: #ffffff;
-    border: 1px solid #d8e0ea;
-    border-radius: 12px;
-    padding: 6px;
-}
-
-QMenu::item {
-    padding: 8px 14px;
-    border-radius: 8px;
-}
-
-QMenu::item:selected {
-    background: #eef4ff;
-    color: #12345a;
-}
-
-QGroupBox {
-    font-size: 14px;
-    font-weight: 600;
-    color: #243b53;
-    background: #ffffff;
-    border: 1px solid #d8e0ea;
-    border-radius: 16px;
-    margin-top: 12px;
-    padding: 16px 14px 14px 14px;
-}
-
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 14px;
-    padding: 0 4px;
-}
-
-QLabel {
-    color: #243b53;
-}
-
-QLineEdit,
-QPlainTextEdit,
-QTextEdit,
-QTableWidget,
-QListWidget,
-QComboBox,
-QDoubleSpinBox {
-    background: #fbfcfe;
-    border: 1px solid #c7d2e2;
-    border-radius: 12px;
-    padding: 6px 8px;
-    selection-background-color: #cfe1ff;
-}
-
-QLineEdit:focus,
-QPlainTextEdit:focus,
-QTextEdit:focus,
-QTableWidget:focus,
-QListWidget:focus,
-QComboBox:focus,
-QDoubleSpinBox:focus {
-    border: 1px solid #4c8bf5;
-}
-
-QPushButton {
-    background: #e8eef9;
-    color: #16324f;
-    border: 1px solid #c4d4ec;
-    border-radius: 12px;
-    padding: 8px 12px;
-}
-
-QPushButton:hover {
-    background: #dce8fb;
-}
-
-QPushButton#primaryButton {
-    background: #1f5fbf;
-    color: #ffffff;
-    border: none;
-}
-
-QPushButton#primaryButton:hover {
-    background: #184d9a;
-}
-
-QHeaderView::section {
-    background: #eff4fb;
-    color: #243b53;
-    border: none;
-    border-bottom: 1px solid #d8e0ea;
-    padding: 8px;
-    font-weight: 600;
-}
-
-QFrame#metricCard {
-    background: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 1, stop: 0 #ffffff, stop: 1 #edf5ff);
-    border: 1px solid #d1ddef;
-    border-radius: 18px;
-}
-
-QLabel#metricTitle {
-    color: #5b7083;
-    font-size: 12px;
-    font-weight: 600;
-}
-
-QLabel#metricValue {
-    color: #12345a;
-    font-size: 24px;
-    font-weight: 700;
-}
-
-QLabel#resultHeadline {
-    color: #12345a;
-    font-size: 20px;
-    font-weight: 700;
-}
-
-QLabel#resultSubline {
-    color: #486581;
-    font-size: 13px;
-}
-
-QLabel#warningLabel {
-    background: #fff4e5;
-    color: #9c5b00;
-    border: 1px solid #ffd59c;
-    border-radius: 12px;
-    padding: 10px 12px;
-}
-
-QLabel#infoPill {
-    color: #486581;
-    background: #edf3fb;
-    border-radius: 12px;
-    padding: 8px 10px;
-}
-"""
+from .theme import apply_application_theme
+from .updates import LATEST_RELEASE_API_URL, ReleaseInfo, parse_release_payload
 
 
 class MeasurementItemDelegate(QStyledItemDelegate):
@@ -236,8 +81,78 @@ class MeasurementItemDelegate(QStyledItemDelegate):
         if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             row_value = editor.property("measurementRow")
             if row_value is not None:
+                self.commitData.emit(editor)
+                self.closeEditor.emit(editor, QAbstractItemDelegate.EndEditHint.NoHint)
                 QTimer.singleShot(0, lambda current_row=int(row_value): self.enterPressed.emit(current_row))
+                return True
         return super().eventFilter(editor, event)
+
+
+def _format_release_date(published_at: str) -> str:
+    if not published_at:
+        return "未知时间"
+    try:
+        release_datetime = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+    except ValueError:
+        return published_at
+    if release_datetime.tzinfo is not None:
+        release_datetime = release_datetime.astimezone()
+    return release_datetime.strftime("%Y-%m-%d %H:%M")
+
+
+class UpdateDialog(QDialog):
+    def __init__(self, release: ReleaseInfo, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.release = release
+
+        self.setWindowTitle("发现新版本")
+        self.resize(760, 560)
+
+        layout = QVBoxLayout(self)
+
+        headline = QLabel(f"发现新版本 {release.version}")
+        headline.setObjectName("resultHeadline")
+        headline.setWordWrap(True)
+        layout.addWidget(headline)
+
+        sublines = []
+        if release.title and release.title != release.version:
+            sublines.append(release.title)
+        if release.published_at:
+            sublines.append(f"发布时间：{_format_release_date(release.published_at)}")
+        if release.assets:
+            sublines.append(f"可下载附件：{len(release.assets)}")
+        subtitle = QLabel(" | ".join(sublines) if sublines else "已获取到 GitHub Release 更新信息。")
+        subtitle.setObjectName("resultSubline")
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        notes_browser = QTextBrowser(self)
+        notes_browser.setOpenExternalLinks(True)
+        if release.body:
+            notes_browser.setMarkdown(release.body)
+        else:
+            notes_browser.setPlainText("本次发布未提供更新说明。")
+        layout.addWidget(notes_browser, 1)
+
+        button_box = QDialogButtonBox(self)
+        download_target = release.download_url or release.html_url
+        download_button = button_box.addButton("下载更新", QDialogButtonBox.ButtonRole.AcceptRole)
+        download_button.setEnabled(bool(download_target))
+        download_button.clicked.connect(lambda: self._open_url(download_target))
+
+        if release.html_url and release.html_url != download_target:
+            release_button = button_box.addButton("查看 Release 页面", QDialogButtonBox.ButtonRole.ActionRole)
+            release_button.clicked.connect(lambda: self._open_url(release.html_url))
+
+        close_button = button_box.addButton("稍后再说", QDialogButtonBox.ButtonRole.RejectRole)
+        close_button.clicked.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def _open_url(self, target: str) -> None:
+        if not target:
+            return
+        QDesktopServices.openUrl(QUrl(target))
 
 
 class MainWindow(QMainWindow):
@@ -249,6 +164,8 @@ class MainWindow(QMainWindow):
         self.current_project_path: str | None = None
         self.is_dirty = False
         self._loading = False
+        self.update_manager = QNetworkAccessManager(self)
+        self.active_update_reply: QNetworkReply | None = None
 
         self.autosave_timer = QTimer(self)
         self.autosave_timer.setSingleShot(True)
@@ -261,6 +178,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._restore_window_state()
         self._load_initial_project()
+        QTimer.singleShot(1200, self._maybe_check_for_updates_on_startup)
 
     def _build_actions(self) -> None:
         self.new_action = QAction("新建项目", self)
@@ -321,6 +239,7 @@ class MainWindow(QMainWindow):
 
     def _build_top_toolbar(self) -> None:
         toolbar = QToolBar("操作栏", self)
+        toolbar.setObjectName("mainToolbar")
         toolbar.setMovable(False)
         toolbar.setFloatable(False)
         toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
@@ -456,7 +375,7 @@ class MainWindow(QMainWindow):
         self.b_table.itemChanged.connect(self._on_b_table_item_changed)
         b_layout.addWidget(self.b_table, 1)
 
-        settings_group = QGroupBox("报告设置")
+        settings_group = QGroupBox("报告与应用设置")
         settings_layout = QVBoxLayout(settings_group)
         settings_form = QFormLayout()
 
@@ -481,6 +400,23 @@ class MainWindow(QMainWindow):
         self.notes_edit.setPlaceholderText("可记录实验条件、仪器型号、B 类来源说明等")
         self.notes_edit.textChanged.connect(self._handle_user_edit)
         settings_layout.addWidget(self.notes_edit)
+
+        settings_layout.addWidget(QLabel("应用设置"))
+
+        self.auto_update_checkbox = QCheckBox("启动时自动检查 GitHub Release 更新")
+        self.auto_update_checkbox.setChecked(auto_update_check_enabled())
+        self.auto_update_checkbox.toggled.connect(self._on_auto_update_toggled)
+        settings_layout.addWidget(self.auto_update_checkbox)
+
+        update_row = QHBoxLayout()
+        self.update_status_label = QLabel(self._default_update_status_text())
+        self.update_status_label.setObjectName("infoPill")
+        self.update_status_label.setWordWrap(True)
+        self.check_updates_button = QPushButton("检查更新")
+        self.check_updates_button.clicked.connect(lambda: self.check_for_updates(manual=True))
+        update_row.addWidget(self.update_status_label, 1)
+        update_row.addWidget(self.check_updates_button)
+        settings_layout.addLayout(update_row)
 
         refresh_button = QPushButton("刷新计算")
         refresh_button.setObjectName("primaryButton")
@@ -976,14 +912,22 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("已清空最近项目历史", 3000)
 
     def show_about_dialog(self) -> None:
-        QMessageBox.about(
-            self,
-            "关于本程序",
-            f"{APP_DISPLAY_NAME}\n版本 {APP_VERSION}\n作者: Leafuke\n\n"
-            "用于物理实验课中单一物理量的不确定度计算。\n"
-            "当前支持 A 类评定、B 类评定、合成标准不确定度、扩展不确定度，\n"
-            "并支持项目保存、Excel 导入、数据/结果 Excel 导出、TXT 导出和结果图片导出。",
+        message_box = QMessageBox(self)
+        message_box.setWindowTitle("关于本程序")
+        message_box.setIcon(QMessageBox.Icon.Information)
+        message_box.setTextFormat(Qt.TextFormat.RichText)
+        message_box.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        message_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        message_box.setText(
+            f"<b>{APP_DISPLAY_NAME}</b><br>"
+            f"版本 {APP_VERSION}<br>"
+            "作者: Leafuke<br><br>"
+            "用于物理实验课中单一物理量的不确定度计算。<br>"
+            "当前支持 A 类评定、B 类评定、合成标准不确定度、扩展不确定度，"
+            "并支持项目保存、Excel 导入、数据/结果 Excel 导出、TXT 导出和结果图片导出。<br><br>"
+            f"本项目已按 {APP_LICENSE_NAME} 开源：<a href=\"{APP_REPOSITORY_URL}\">{APP_REPOSITORY_URL}</a>"
         )
+        message_box.exec()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if not self._ensure_safe_to_continue():
@@ -1039,6 +983,7 @@ class MainWindow(QMainWindow):
         if self._loading:
             return
         item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._ensure_measurement_placeholder_row()
         self._handle_user_edit()
 
     def _on_b_table_item_changed(self, item: QTableWidgetItem) -> None:
@@ -1092,23 +1037,64 @@ class MainWindow(QMainWindow):
         if values:
             for value in values:
                 self.add_measurement_row(format_number(value))
-        self.add_measurement_row("")
+        self._ensure_measurement_placeholder_row()
         self._loading = False
+
+    def _ensure_measurement_placeholder_row(self) -> int:
+        previous_loading_state = self._loading
+        self._loading = True
+        try:
+            if self.measurement_table.rowCount() == 0:
+                self.add_measurement_row("")
+
+            for row in range(self.measurement_table.rowCount()):
+                item = self.measurement_table.item(row, 0)
+                if item is None:
+                    item = QTableWidgetItem("")
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    self.measurement_table.setItem(row, 0, item)
+
+            last_row = self.measurement_table.rowCount() - 1
+            last_item = self.measurement_table.item(last_row, 0)
+            last_text = last_item.text().strip() if last_item else ""
+            if last_text:
+                self.add_measurement_row("")
+
+            while self.measurement_table.rowCount() > 1:
+                last_item = self.measurement_table.item(self.measurement_table.rowCount() - 1, 0)
+                previous_item = self.measurement_table.item(self.measurement_table.rowCount() - 2, 0)
+                last_text = last_item.text().strip() if last_item else ""
+                previous_text = previous_item.text().strip() if previous_item else ""
+                if last_text or previous_text:
+                    break
+                self.measurement_table.removeRow(self.measurement_table.rowCount() - 1)
+
+            placeholder_row = self.measurement_table.rowCount() - 1
+            if placeholder_row < 0:
+                self.add_measurement_row("")
+                placeholder_row = self.measurement_table.rowCount() - 1
+
+            placeholder_item = self.measurement_table.item(placeholder_row, 0)
+            if placeholder_item is None:
+                placeholder_item = QTableWidgetItem("")
+                placeholder_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.measurement_table.setItem(placeholder_row, 0, placeholder_item)
+            return placeholder_row
+        finally:
+            self._loading = previous_loading_state
 
     def _move_to_next_measurement_input(self, row: int) -> None:
         if self._loading:
             return
 
+        self._ensure_measurement_placeholder_row()
         current_item = self.measurement_table.item(row, 0)
         current_text = current_item.text().strip() if current_item else ""
         if not current_text:
             self._focus_measurement_row(row)
             return
 
-        next_row = row + 1
-        if next_row >= self.measurement_table.rowCount():
-            self.add_measurement_row("")
-
+        next_row = min(row + 1, self.measurement_table.rowCount() - 1)
         self._focus_measurement_row(next_row)
 
     def _focus_measurement_row(self, row: int) -> None:
@@ -1238,6 +1224,100 @@ class MainWindow(QMainWindow):
         except Exception:
             return
 
+    def _default_update_status_text(self) -> str:
+        auto_check_text = "已开启" if auto_update_check_enabled() else "已关闭"
+        return f"当前版本: {APP_VERSION}，{auto_check_text}启动时自动检查更新。"
+
+    def _set_update_status(self, text: str) -> None:
+        self.update_status_label.setText(text)
+
+    def _on_auto_update_toggled(self, checked: bool) -> None:
+        set_auto_update_check_enabled(checked)
+        self._set_update_status(self._default_update_status_text())
+        message = "已启用启动时自动检查更新" if checked else "已关闭启动时自动检查更新"
+        self.statusBar().showMessage(message, 4000)
+
+    def _maybe_check_for_updates_on_startup(self) -> None:
+        if self.auto_update_checkbox.isChecked():
+            self.check_for_updates(manual=False)
+
+    def check_for_updates(self, manual: bool = False) -> None:
+        if self.active_update_reply is not None:
+            if manual:
+                self.statusBar().showMessage("正在检查更新，请稍候。", 3000)
+            return
+
+        request = QNetworkRequest(QUrl(LATEST_RELEASE_API_URL))
+        request.setRawHeader(b"Accept", b"application/vnd.github+json")
+        request.setRawHeader(b"User-Agent", f"{APP_DISPLAY_NAME}/{APP_VERSION}".encode("utf-8"))
+
+        self.active_update_reply = self.update_manager.get(request)
+        self.active_update_reply.finished.connect(lambda manual_check=manual: self._finish_update_check(manual_check))
+        self.check_updates_button.setEnabled(False)
+        self._set_update_status("正在检查 GitHub Release 更新...")
+        if manual:
+            self.statusBar().showMessage("正在检查 GitHub Release 更新...", 3000)
+
+    def _finish_update_check(self, manual: bool) -> None:
+        reply = self.active_update_reply
+        self.active_update_reply = None
+        self.check_updates_button.setEnabled(True)
+        if reply is None:
+            return
+
+        try:
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                if self._update_http_status(reply) == 404:
+                    message = "当前仓库还没有已发布的 GitHub Release，暂时无法比较更新。"
+                    self._set_update_status("尚未发现可用的 GitHub Release。")
+                    if manual:
+                        QMessageBox.information(self, "暂未发布 Release", message)
+                    return
+
+                message = self._update_error_message(reply)
+                self._set_update_status("更新检查失败，可稍后手动重试。")
+                if manual:
+                    QMessageBox.warning(self, "更新检查失败", message)
+                return
+
+            payload_text = bytes(reply.readAll()).decode("utf-8")
+            release = parse_release_payload(json.loads(payload_text), APP_VERSION)
+        except Exception as exc:
+            self._set_update_status("更新检查失败，可稍后手动重试。")
+            if manual:
+                QMessageBox.warning(self, "更新检查失败", str(exc))
+            return
+        finally:
+            reply.deleteLater()
+
+        if release.is_newer:
+            self._set_update_status(f"发现新版本: {release.version}")
+            self.statusBar().showMessage(f"发现新版本 {release.version}", 5000)
+            UpdateDialog(release, self).exec()
+            return
+
+        self._set_update_status(f"当前已是最新版本: {APP_VERSION}")
+        if manual:
+            QMessageBox.information(self, "已是最新版本", f"当前版本 {APP_VERSION} 已是最新版本。")
+
+    def _update_http_status(self, reply: QNetworkReply) -> int | None:
+        http_status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        if http_status is None:
+            return None
+        try:
+            return int(http_status)
+        except (TypeError, ValueError):
+            return None
+
+    def _update_error_message(self, reply: QNetworkReply) -> str:
+        http_status = self._update_http_status(reply)
+        reason = reply.attribute(QNetworkRequest.Attribute.HttpReasonPhraseAttribute)
+        details = reply.errorString()
+        if http_status:
+            reason_text = str(reason) if reason else details
+            return f"HTTP {http_status}: {reason_text}"
+        return details or "未知网络错误"
+
     def _ensure_safe_to_continue(self) -> bool:
         if not self.is_dirty:
             return True
@@ -1298,7 +1378,11 @@ def run() -> None:
     app.setStyle(QStyleFactory.create("Fusion"))
     app.setApplicationDisplayName(APP_DISPLAY_NAME)
     app.setApplicationName(APP_DISPLAY_NAME)
-    app.setStyleSheet(APP_STYLE_SHEET)
+    apply_application_theme(app)
+
+    color_scheme_changed = getattr(app.styleHints(), "colorSchemeChanged", None)
+    if color_scheme_changed is not None:
+        color_scheme_changed.connect(lambda color_scheme: apply_application_theme(app, color_scheme))
 
     icon = _load_app_icon()
     if icon is not None:
