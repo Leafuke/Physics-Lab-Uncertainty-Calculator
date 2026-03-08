@@ -47,7 +47,7 @@ pip install pyinstaller
 然后在项目根目录执行：
 
 ```bash
-pyinstaller --noconfirm --windowed --name 物理实验不确定度计算工具 --icon app.ico main.py
+pyinstaller --noconfirm --windowed --name 物理实验不确定度计算工具 --icon assets/app.ico main.py
 ```
 
 打包完成后，可执行文件会出现在 `dist/物理实验不确定度计算工具/` 下。
