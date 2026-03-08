@@ -1,0 +1,75 @@
+name: Upload Linux Release Asset
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: release-linux
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    name: Build and Upload Linux Asset
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Read version from source
+        id: meta
+        shell: bash
+        run: python .github/scripts/release_assets.py version --root . --github-output "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller py7zr pillow
+
+      - name: Build application
+        shell: bash
+        env:
+          APP_NAME: ${{ steps.meta.outputs.app_name }}
+        run: |
+          pyinstaller --noconfirm --windowed --name "$APP_NAME" --icon assets/app.ico main.py
+
+      - name: Package release archive
+        id: package
+        shell: bash
+        env:
+          APP_NAME: ${{ steps.meta.outputs.app_name }}
+        run: |
+          python .github/scripts/release_assets.py package \
+            --root . \
+            --platform linux \
+            --arch x64 \
+            --dist-dir "dist/$APP_NAME" \
+            --icon-path "assets/app.ico" \
+            --output-dir "release" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload asset to existing release
+        shell: bash
+        env:
+          APP_TAG: ${{ steps.meta.outputs.tag }}
+          ASSET_PATH: ${{ steps.package.outputs.asset_path }}
+        run: |
+          if ! gh release view "$APP_TAG" >/dev/null 2>&1; then
+            echo "Release $APP_TAG does not exist. Run the Windows release workflow first." >&2
+            exit 1
+          fi
+
+          gh release upload "$APP_TAG" "$ASSET_PATH" --clobber

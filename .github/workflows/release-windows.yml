@@ -1,0 +1,84 @@
+name: Release Windows
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: release-windows
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and Publish Windows Release
+    runs-on: windows-2022
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Read version from source
+        id: meta
+        shell: pwsh
+        run: |
+          python .github/scripts/release_assets.py version --root . --github-output "$env:GITHUB_OUTPUT"
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller pillow
+
+      - name: Build application
+        shell: pwsh
+        env:
+          APP_NAME: ${{ steps.meta.outputs.app_name }}
+        run: |
+          pyinstaller --noconfirm --windowed --name "$env:APP_NAME" --icon assets/app.ico main.py
+
+      - name: Package release archive
+        id: package
+        shell: pwsh
+        env:
+          APP_NAME: ${{ steps.meta.outputs.app_name }}
+        run: |
+          python .github/scripts/release_assets.py package `
+            --root . `
+            --platform windows `
+            --arch x64 `
+            --dist-dir "dist/$env:APP_NAME" `
+            --icon-path "assets/app.ico" `
+            --output-dir "release" `
+            --github-output "$env:GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        shell: pwsh
+        run: |
+          python .github/scripts/release_assets.py notes --root . --output release_notes.md
+
+      - name: Create or update release
+        shell: pwsh
+        env:
+          APP_TAG: ${{ steps.meta.outputs.tag }}
+          APP_VERSION: ${{ steps.meta.outputs.version }}
+          ASSET_PATH: ${{ steps.package.outputs.asset_path }}
+        run: |
+          gh release view "$env:APP_TAG" | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            gh release edit "$env:APP_TAG" --title "$env:APP_VERSION" --notes-file release_notes.md
+            gh release upload "$env:APP_TAG" "$env:ASSET_PATH" --clobber
+          }
+          else {
+            gh release create "$env:APP_TAG" "$env:ASSET_PATH" --title "$env:APP_VERSION" --notes-file release_notes.md
+          }
