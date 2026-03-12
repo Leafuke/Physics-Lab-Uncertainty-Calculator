@@ -6,6 +6,7 @@ from typing import Any
 
 
 LATEST_RELEASE_API_URL = "https://api.github.com/repos/Leafuke/Physics-Lab-Uncertainty-Calculator/releases/latest"
+RELEASES_API_URL = "https://api.github.com/repos/Leafuke/Physics-Lab-Uncertainty-Calculator/releases?per_page=1"
 
 
 @dataclass(frozen=True)
@@ -28,7 +29,8 @@ class ReleaseInfo:
     is_newer: bool = False
 
 
-def parse_release_payload(payload: dict[str, Any], current_version: str) -> ReleaseInfo:
+def parse_release_payload(payload: Any, current_version: str) -> ReleaseInfo:
+    payload = _normalize_release_payload(payload)
     version = str(payload.get("tag_name") or payload.get("name") or "").strip()
     if not version:
         api_message = str(payload.get("message") or "").strip()
@@ -82,6 +84,19 @@ def _pick_download_url(assets: list[ReleaseAsset], fallback_url: str) -> str:
                 return asset.download_url
 
     return assets[0].download_url
+
+
+def _normalize_release_payload(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                return item
+        raise ValueError("当前仓库还没有已发布的 GitHub Release。")
+
+    if isinstance(payload, dict):
+        return payload
+
+    raise ValueError("GitHub Release 返回数据格式不正确。")
 
 
 def _version_key(version_text: str) -> tuple[int, ...]:

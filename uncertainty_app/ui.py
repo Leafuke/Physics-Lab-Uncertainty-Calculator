@@ -12,7 +12,6 @@ from PySide6.QtWidgets import (
     QAbstractItemDelegate,
     QAbstractItemView,
     QApplication,
-    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -37,6 +36,7 @@ from PySide6.QtWidgets import (
     QStyleFactory,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QTextEdit,
     QTextBrowser,
     QToolBar,
@@ -64,7 +64,7 @@ from .persistence import (
     write_autosave,
 )
 from .theme import apply_application_theme
-from .updates import LATEST_RELEASE_API_URL, ReleaseInfo, parse_release_payload
+from .updates import LATEST_RELEASE_API_URL, RELEASES_API_URL, ReleaseInfo, parse_release_payload
 
 
 class MeasurementItemDelegate(QStyledItemDelegate):
@@ -172,7 +172,7 @@ class MainWindow(QMainWindow):
         self.autosave_timer.timeout.connect(self._write_autosave_snapshot)
 
         self.setWindowTitle(APP_DISPLAY_NAME)
-        self.setMinimumSize(1420, 880)
+        self.setMinimumSize(1260, 820)
 
         self._build_actions()
         self._build_ui()
@@ -215,6 +215,17 @@ class MainWindow(QMainWindow):
         self.clear_recent_action = QAction("清空最近项目", self)
         self.clear_recent_action.triggered.connect(self.clear_recent_project_history)
 
+        self.check_updates_action = QAction("检查更新", self)
+        self.check_updates_action.triggered.connect(lambda: self.check_for_updates(manual=True))
+
+        self.auto_update_action = QAction("启动时自动检查更新", self)
+        self.auto_update_action.setCheckable(True)
+        self.auto_update_action.setChecked(auto_update_check_enabled())
+        self.auto_update_action.toggled.connect(self._on_auto_update_toggled)
+
+        self.update_status_action = QAction(self._default_update_status_text(), self)
+        self.update_status_action.setEnabled(False)
+
     def _build_ui(self) -> None:
         self._build_top_toolbar()
 
@@ -225,12 +236,10 @@ class MainWindow(QMainWindow):
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
         main_splitter.setChildrenCollapsible(False)
 
-        main_splitter.addWidget(self._build_left_panel())
-        main_splitter.addWidget(self._build_center_panel())
+        main_splitter.addWidget(self._build_workspace_panel())
         main_splitter.addWidget(self._build_right_panel())
-        main_splitter.setStretchFactor(0, 4)
-        main_splitter.setStretchFactor(1, 5)
-        main_splitter.setStretchFactor(2, 6)
+        main_splitter.setStretchFactor(0, 7)
+        main_splitter.setStretchFactor(1, 6)
 
         central_layout.addWidget(main_splitter)
         self.setCentralWidget(central_widget)
@@ -266,6 +275,20 @@ class MainWindow(QMainWindow):
         self.recent_projects_button.setMenu(self.recent_projects_menu)
         toolbar.addWidget(self.recent_projects_button)
 
+        self.update_menu = QMenu(self)
+        self.update_menu.addAction(self.check_updates_action)
+        self.update_menu.addAction(self.auto_update_action)
+        self.update_menu.addSeparator()
+        self.update_menu.addAction(self.update_status_action)
+
+        self.update_button = QToolButton(self)
+        self.update_button.setText("更新")
+        self.update_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.update_button.clicked.connect(lambda: self.check_for_updates(manual=True))
+        self.update_button.setMenu(self.update_menu)
+        self.update_button.setToolTip(self._default_update_status_text())
+        toolbar.addWidget(self.update_button)
+
         about_button = QToolButton(self)
         about_button.setText("关于本程序")
         about_button.clicked.connect(self.show_about_dialog)
@@ -273,27 +296,85 @@ class MainWindow(QMainWindow):
 
         self.addToolBar(toolbar)
 
-    def _build_left_panel(self) -> QWidget:
+    def _build_workspace_panel(self) -> QWidget:
         panel = QWidget(self)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
 
-        project_group = QGroupBox("项目与原始数据")
+        layout.addWidget(self._build_project_settings_group())
+
+        workspace_splitter = QSplitter(Qt.Orientation.Vertical)
+        workspace_splitter.setChildrenCollapsible(False)
+        workspace_splitter.addWidget(self._build_measurements_group())
+        workspace_splitter.addWidget(self._build_b_sources_group())
+        workspace_splitter.setStretchFactor(0, 6)
+        workspace_splitter.setStretchFactor(1, 5)
+        layout.addWidget(workspace_splitter, 1)
+
+        return panel
+
+    def _build_project_settings_group(self) -> QGroupBox:
+        project_group = QGroupBox("项目设置")
         project_layout = QVBoxLayout(project_group)
 
-        project_form = QFormLayout()
+        forms_row = QHBoxLayout()
+        forms_row.setSpacing(12)
+
+        left_form = QFormLayout()
         self.quantity_name_edit = QLineEdit()
         self.quantity_name_edit.setPlaceholderText("例如：单摆周期、钢丝长度、电压")
         self.quantity_name_edit.textChanged.connect(self._handle_user_edit)
+        left_form.addRow("测量量名称", self.quantity_name_edit)
 
         self.unit_edit = QLineEdit()
         self.unit_edit.setPlaceholderText("例如：s、cm、V")
         self.unit_edit.textChanged.connect(self._handle_user_edit)
+        left_form.addRow("单位", self.unit_edit)
 
-        project_form.addRow("测量量名称", self.quantity_name_edit)
-        project_form.addRow("单位", self.unit_edit)
-        project_layout.addLayout(project_form)
+        right_form = QFormLayout()
+
+        self.coverage_factor_spin = QDoubleSpinBox()
+        self.coverage_factor_spin.setRange(0.1, 99.0)
+        self.coverage_factor_spin.setDecimals(3)
+        self.coverage_factor_spin.setSingleStep(0.1)
+        self.coverage_factor_spin.valueChanged.connect(self._handle_user_edit)
+        right_form.addRow("覆盖因子 k", self.coverage_factor_spin)
+
+        self.result_decimal_combo = QComboBox()
+        self.result_decimal_combo.addItem("自动修约", None)
+        for digits in range(0, 11):
+            self.result_decimal_combo.addItem(f"固定 {digits} 位", digits)
+        self.result_decimal_combo.currentIndexChanged.connect(self._handle_user_edit)
+        right_form.addRow("结果保留小数位", self.result_decimal_combo)
+
+        forms_row.addLayout(left_form, 1)
+        forms_row.addLayout(right_form, 1)
+        project_layout.addLayout(forms_row)
+
+        project_layout.addWidget(QLabel("项目备注"))
+
+        self.notes_edit = QTextEdit()
+        self.notes_edit.setPlaceholderText("可记录实验条件、仪器型号、B 类来源说明等")
+        self.notes_edit.setMaximumHeight(110)
+        self.notes_edit.textChanged.connect(self._handle_user_edit)
+        project_layout.addWidget(self.notes_edit)
+
+        footer_row = QHBoxLayout()
+        footer_hint = QLabel("结果会随输入自动更新；当前仍按单一物理量、各分量彼此独立的模型计算。")
+        footer_hint.setObjectName("infoPill")
+        footer_hint.setWordWrap(True)
+        refresh_button = QPushButton("刷新计算")
+        refresh_button.clicked.connect(self.refresh_calculation)
+        footer_row.addWidget(footer_hint, 1)
+        footer_row.addWidget(refresh_button)
+        project_layout.addLayout(footer_row)
+
+        return project_group
+
+    def _build_measurements_group(self) -> QGroupBox:
+        project_group = QGroupBox("原始数据")
+        project_layout = QVBoxLayout(project_group)
 
         values_button_row = QHBoxLayout()
         add_value_button = QPushButton("新增行")
@@ -339,17 +420,10 @@ class MainWindow(QMainWindow):
         self.import_info_label.setWordWrap(True)
         project_layout.addWidget(self.import_info_label)
 
-        layout.addWidget(project_group, 1)
+        return project_group
 
-        return panel
-
-    def _build_center_panel(self) -> QWidget:
-        panel = QWidget(self)
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
-
-        b_group = QGroupBox("B类评定与计算设置")
+    def _build_b_sources_group(self) -> QGroupBox:
+        b_group = QGroupBox("B类分量")
         b_layout = QVBoxLayout(b_group)
 
         b_button_row = QHBoxLayout()
@@ -375,57 +449,7 @@ class MainWindow(QMainWindow):
         self.b_table.itemChanged.connect(self._on_b_table_item_changed)
         b_layout.addWidget(self.b_table, 1)
 
-        settings_group = QGroupBox("报告与应用设置")
-        settings_layout = QVBoxLayout(settings_group)
-        settings_form = QFormLayout()
-
-        self.coverage_factor_spin = QDoubleSpinBox()
-        self.coverage_factor_spin.setRange(0.1, 99.0)
-        self.coverage_factor_spin.setDecimals(3)
-        self.coverage_factor_spin.setSingleStep(0.1)
-        self.coverage_factor_spin.valueChanged.connect(self._handle_user_edit)
-        settings_form.addRow("覆盖因子 k", self.coverage_factor_spin)
-
-        self.result_decimal_combo = QComboBox()
-        self.result_decimal_combo.addItem("自动修约", None)
-        for digits in range(0, 11):
-            self.result_decimal_combo.addItem(f"固定 {digits} 位", digits)
-        self.result_decimal_combo.currentIndexChanged.connect(self._handle_user_edit)
-        settings_form.addRow("结果保留小数位", self.result_decimal_combo)
-
-        settings_layout.addLayout(settings_form)
-        settings_layout.addWidget(QLabel("项目备注"))
-
-        self.notes_edit = QTextEdit()
-        self.notes_edit.setPlaceholderText("可记录实验条件、仪器型号、B 类来源说明等")
-        self.notes_edit.textChanged.connect(self._handle_user_edit)
-        settings_layout.addWidget(self.notes_edit)
-
-        settings_layout.addWidget(QLabel("应用设置"))
-
-        self.auto_update_checkbox = QCheckBox("启动时自动检查 GitHub Release 更新")
-        self.auto_update_checkbox.setChecked(auto_update_check_enabled())
-        self.auto_update_checkbox.toggled.connect(self._on_auto_update_toggled)
-        settings_layout.addWidget(self.auto_update_checkbox)
-
-        update_row = QHBoxLayout()
-        self.update_status_label = QLabel(self._default_update_status_text())
-        self.update_status_label.setObjectName("infoPill")
-        self.update_status_label.setWordWrap(True)
-        self.check_updates_button = QPushButton("检查更新")
-        self.check_updates_button.clicked.connect(lambda: self.check_for_updates(manual=True))
-        update_row.addWidget(self.update_status_label, 1)
-        update_row.addWidget(self.check_updates_button)
-        settings_layout.addLayout(update_row)
-
-        refresh_button = QPushButton("刷新计算")
-        refresh_button.setObjectName("primaryButton")
-        refresh_button.clicked.connect(self.refresh_calculation)
-        settings_layout.addWidget(refresh_button)
-
-        layout.addWidget(b_group, 4)
-        layout.addWidget(settings_group, 2)
-        return panel
+        return b_group
 
     def _build_right_panel(self) -> QWidget:
         panel = QWidget(self)
@@ -454,9 +478,14 @@ class MainWindow(QMainWindow):
         summary_layout.addWidget(self.result_subline)
         summary_layout.addWidget(self.warning_label)
 
-        cards_layout = QGridLayout()
-        cards_layout.setHorizontalSpacing(12)
-        cards_layout.setVerticalSpacing(12)
+        metrics_panel = QFrame()
+        metrics_panel.setObjectName("metricPanel")
+        metrics_layout = QGridLayout(metrics_panel)
+        metrics_layout.setContentsMargins(16, 16, 16, 16)
+        metrics_layout.setHorizontalSpacing(20)
+        metrics_layout.setVerticalSpacing(10)
+        metrics_layout.setColumnStretch(0, 0)
+        metrics_layout.setColumnStretch(1, 1)
         self.metric_labels: dict[str, QLabel] = {}
         card_titles = [
             ("mean", "平均值 x̄"),
@@ -466,21 +495,25 @@ class MainWindow(QMainWindow):
             ("U", "扩展不确定度 U"),
         ]
 
-        for index, (key, title) in enumerate(card_titles):
-            card, value_label = self._create_metric_card(title)
-            row = index // 2
-            column = index % 2
-            cards_layout.addWidget(card, row, column)
+        for row, (key, title) in enumerate(card_titles):
+            title_label = QLabel(title)
+            title_label.setObjectName("metricTitle")
+            value_label = QLabel("--")
+            value_label.setObjectName("metricValue")
+            value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            value_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            metrics_layout.addWidget(title_label, row, 0)
+            metrics_layout.addWidget(value_label, row, 1)
             self.metric_labels[key] = value_label
 
-        summary_layout.addLayout(cards_layout)
+        summary_layout.addWidget(metrics_panel)
         layout.addWidget(self.summary_group, 2)
 
-        lower_splitter = QSplitter(Qt.Orientation.Vertical)
-        lower_splitter.setChildrenCollapsible(False)
+        detail_tabs = QTabWidget(self)
 
-        process_group = QGroupBox("计算过程")
-        process_layout = QVBoxLayout(process_group)
+        process_page = QWidget(self)
+        process_layout = QVBoxLayout(process_page)
+        process_layout.setContentsMargins(12, 12, 12, 12)
         self.process_table = QTableWidget(0, 4)
         self.process_table.setHorizontalHeaderLabels(["类别", "项目", "数值", "说明"])
         self.process_table.verticalHeader().setVisible(False)
@@ -491,10 +524,11 @@ class MainWindow(QMainWindow):
         self.process_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.process_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         process_layout.addWidget(self.process_table)
-        lower_splitter.addWidget(process_group)
+        detail_tabs.addTab(process_page, "计算过程")
 
-        report_group = QGroupBox("文本结论")
-        report_layout = QVBoxLayout(report_group)
+        report_page = QWidget(self)
+        report_layout = QVBoxLayout(report_page)
+        report_layout.setContentsMargins(12, 12, 12, 12)
         self.report_text = QPlainTextEdit()
         self.report_text.setReadOnly(True)
         report_layout.addWidget(self.report_text)
@@ -504,26 +538,10 @@ class MainWindow(QMainWindow):
         report_button_row.addStretch(1)
         report_button_row.addWidget(copy_button)
         report_layout.addLayout(report_button_row)
-        lower_splitter.addWidget(report_group)
-        lower_splitter.setStretchFactor(0, 3)
-        lower_splitter.setStretchFactor(1, 2)
+        detail_tabs.addTab(report_page, "文本结论")
 
-        layout.addWidget(lower_splitter, 5)
+        layout.addWidget(detail_tabs, 5)
         return panel
-
-    def _create_metric_card(self, title: str) -> tuple[QFrame, QLabel]:
-        card = QFrame()
-        card.setObjectName("metricCard")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 16, 16, 16)
-        title_label = QLabel(title)
-        title_label.setObjectName("metricTitle")
-        value_label = QLabel("--")
-        value_label.setObjectName("metricValue")
-        value_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(title_label)
-        layout.addWidget(value_label)
-        return card, value_label
 
     def _load_initial_project(self) -> None:
         autosave_project = load_autosave()
@@ -1225,11 +1243,15 @@ class MainWindow(QMainWindow):
             return
 
     def _default_update_status_text(self) -> str:
-        auto_check_text = "已开启" if auto_update_check_enabled() else "已关闭"
+        is_auto_check_enabled = self.auto_update_action.isChecked() if hasattr(self, "auto_update_action") else auto_update_check_enabled()
+        auto_check_text = "已开启" if is_auto_check_enabled else "已关闭"
         return f"当前版本: {APP_VERSION}，{auto_check_text}启动时自动检查更新。"
 
     def _set_update_status(self, text: str) -> None:
-        self.update_status_label.setText(text)
+        if hasattr(self, "update_status_action"):
+            self.update_status_action.setText(text)
+        if hasattr(self, "update_button"):
+            self.update_button.setToolTip(text)
 
     def _on_auto_update_toggled(self, checked: bool) -> None:
         set_auto_update_check_enabled(checked)
@@ -1238,7 +1260,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message, 4000)
 
     def _maybe_check_for_updates_on_startup(self) -> None:
-        if self.auto_update_checkbox.isChecked():
+        if self.auto_update_action.isChecked():
             self.check_for_updates(manual=False)
 
     def check_for_updates(self, manual: bool = False) -> None:
@@ -1247,31 +1269,44 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("正在检查更新，请稍候。", 3000)
             return
 
-        request = QNetworkRequest(QUrl(LATEST_RELEASE_API_URL))
+        self._start_update_request(manual, LATEST_RELEASE_API_URL, "latest")
+
+    def _start_update_request(self, manual: bool, url: str, request_kind: str) -> None:
+        request = QNetworkRequest(QUrl(url))
+        request.setAttribute(QNetworkRequest.Attribute.Http2AllowedAttribute, False)
+        request.setAttribute(
+            QNetworkRequest.Attribute.RedirectPolicyAttribute,
+            QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy,
+        )
         request.setRawHeader(b"Accept", b"application/vnd.github+json")
+        request.setRawHeader(b"X-GitHub-Api-Version", b"2022-11-28")
         request.setRawHeader(b"User-Agent", f"{APP_DISPLAY_NAME}/{APP_VERSION}".encode("utf-8"))
 
         self.active_update_reply = self.update_manager.get(request)
-        self.active_update_reply.finished.connect(lambda manual_check=manual: self._finish_update_check(manual_check))
-        self.check_updates_button.setEnabled(False)
+        self.active_update_reply.setProperty("manualCheck", manual)
+        self.active_update_reply.setProperty("requestKind", request_kind)
+        self.active_update_reply.finished.connect(self._finish_update_check)
+        self.check_updates_action.setEnabled(False)
+        self.update_button.setText("检查中...")
         self._set_update_status("正在检查 GitHub Release 更新...")
         if manual:
             self.statusBar().showMessage("正在检查 GitHub Release 更新...", 3000)
 
-    def _finish_update_check(self, manual: bool) -> None:
+    def _finish_update_check(self) -> None:
         reply = self.active_update_reply
         self.active_update_reply = None
-        self.check_updates_button.setEnabled(True)
+        self.check_updates_action.setEnabled(True)
+        self.update_button.setText("更新")
         if reply is None:
             return
 
+        manual = bool(reply.property("manualCheck"))
+        request_kind = str(reply.property("requestKind") or "latest")
+
         try:
             if reply.error() != QNetworkReply.NetworkError.NoError:
-                if self._update_http_status(reply) == 404:
-                    message = "当前仓库还没有已发布的 GitHub Release，暂时无法比较更新。"
-                    self._set_update_status("尚未发现可用的 GitHub Release。")
-                    if manual:
-                        QMessageBox.information(self, "暂未发布 Release", message)
+                if request_kind == "latest" and self._update_http_status(reply) == 404:
+                    self._start_update_request(manual, RELEASES_API_URL, "list")
                     return
 
                 message = self._update_error_message(reply)
@@ -1281,7 +1316,20 @@ class MainWindow(QMainWindow):
                 return
 
             payload_text = bytes(reply.readAll()).decode("utf-8")
-            release = parse_release_payload(json.loads(payload_text), APP_VERSION)
+            try:
+                release = parse_release_payload(json.loads(payload_text), APP_VERSION)
+            except ValueError as exc:
+                if request_kind == "latest":
+                    self._start_update_request(manual, RELEASES_API_URL, "list")
+                    return
+
+                message = str(exc)
+                if "还没有已发布的 GitHub Release" in message:
+                    self._set_update_status("尚未发现可用的 GitHub Release。")
+                    if manual:
+                        QMessageBox.information(self, "暂未发布 Release", message)
+                    return
+                raise
         except Exception as exc:
             self._set_update_status("更新检查失败，可稍后手动重试。")
             if manual:
@@ -1313,6 +1361,8 @@ class MainWindow(QMainWindow):
         http_status = self._update_http_status(reply)
         reason = reply.attribute(QNetworkRequest.Attribute.HttpReasonPhraseAttribute)
         details = reply.errorString()
+        if "header compression context" in details.lower():
+            return "连接 GitHub Release 时出现网络协议兼容问题，请稍后重试。"
         if http_status:
             reason_text = str(reason) if reason else details
             return f"HTTP {http_status}: {reason_text}"

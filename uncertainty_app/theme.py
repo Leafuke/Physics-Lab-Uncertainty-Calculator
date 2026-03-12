@@ -183,7 +183,36 @@ QHeaderView::section {
     font-weight: 600;
 }
 
-QFrame#metricCard {
+QTabWidget::pane {
+    background: {group_bg};
+    border: 1px solid {border};
+    border-radius: 16px;
+    top: -1px;
+}
+
+QTabBar::tab {
+    background: transparent;
+    color: {metric_title};
+    border: 1px solid transparent;
+    border-top-left-radius: 10px;
+    border-top-right-radius: 10px;
+    padding: 8px 14px;
+    margin-right: 4px;
+}
+
+QTabBar::tab:selected {
+    background: {group_bg};
+    color: {group_text};
+    border: 1px solid {border};
+    border-bottom-color: {group_bg};
+}
+
+QTabBar::tab:hover:!selected {
+    background: {hover_bg};
+    color: {label_text};
+}
+
+QFrame#metricPanel {
     background: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 1, stop: 0 {card_start}, stop: 1 {card_end});
     border: 1px solid {card_border};
     border-radius: 18px;
@@ -197,7 +226,7 @@ QLabel#metricTitle {
 
 QLabel#metricValue {
     color: {metric_value};
-    font-size: 24px;
+    font-size: 20px;
     font-weight: 700;
 }
 
