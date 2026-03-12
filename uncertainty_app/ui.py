@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStyledItemDelegate,
     QStyleFactory,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -48,7 +49,17 @@ from PySide6.QtWidgets import (
 from . import APP_DISPLAY_NAME, APP_LICENSE_NAME, APP_REPOSITORY_URL, APP_VERSION
 from .calculations import CalculationResult, calculate_project, format_number, normalize_decimal_places, rounded_measurement
 from .excel_io import export_data_to_excel, export_project_to_excel, import_measurements_from_excel
-from .models import BSource, BSourceType, ProjectData, b_source_display_name, default_divisor_for
+from .formula_engine import split_expression_assignment
+from .models import (
+    BSource,
+    BSourceType,
+    FormulaVariable,
+    ProjectData,
+    ProjectMode,
+    b_source_display_name,
+    default_divisor_for,
+    project_mode_display_name,
+)
 from .persistence import (
     auto_update_check_enabled,
     clear_recent_files,
@@ -166,6 +177,7 @@ class MainWindow(QMainWindow):
         self._loading = False
         self.update_manager = QNetworkAccessManager(self)
         self.active_update_reply: QNetworkReply | None = None
+        self.formula_workspace_variables: list[FormulaVariable] = []
 
         self.autosave_timer = QTimer(self)
         self.autosave_timer.setSingleShot(True)
@@ -304,13 +316,10 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self._build_project_settings_group())
 
-        workspace_splitter = QSplitter(Qt.Orientation.Vertical)
-        workspace_splitter.setChildrenCollapsible(False)
-        workspace_splitter.addWidget(self._build_measurements_group())
-        workspace_splitter.addWidget(self._build_b_sources_group())
-        workspace_splitter.setStretchFactor(0, 6)
-        workspace_splitter.setStretchFactor(1, 5)
-        layout.addWidget(workspace_splitter, 1)
+        self.workspace_stack = QStackedWidget(self)
+        self.workspace_stack.addWidget(self._build_measurement_workspace_page())
+        self.workspace_stack.addWidget(self._build_formula_workspace_page())
+        layout.addWidget(self.workspace_stack, 1)
 
         return panel
 
@@ -322,13 +331,19 @@ class MainWindow(QMainWindow):
         forms_row.setSpacing(12)
 
         left_form = QFormLayout()
+        self.project_mode_combo = QComboBox()
+        for project_mode in ProjectMode:
+            self.project_mode_combo.addItem(project_mode_display_name(project_mode.value), project_mode.value)
+        self.project_mode_combo.currentIndexChanged.connect(self._on_project_mode_changed)
+        left_form.addRow("项目类型", self.project_mode_combo)
+
         self.quantity_name_edit = QLineEdit()
-        self.quantity_name_edit.setPlaceholderText("例如：单摆周期、钢丝长度、电压")
+        self.quantity_name_edit.setPlaceholderText("例如：钢丝长度、面积 S、折射率 n")
         self.quantity_name_edit.textChanged.connect(self._handle_user_edit)
         left_form.addRow("测量量名称", self.quantity_name_edit)
 
         self.unit_edit = QLineEdit()
-        self.unit_edit.setPlaceholderText("例如：s、cm、V")
+        self.unit_edit.setPlaceholderText("例如：s、cm、V；公式项目留空时将尝试自动推导")
         self.unit_edit.textChanged.connect(self._handle_user_edit)
         left_form.addRow("单位", self.unit_edit)
 
@@ -361,16 +376,98 @@ class MainWindow(QMainWindow):
         project_layout.addWidget(self.notes_edit)
 
         footer_row = QHBoxLayout()
-        footer_hint = QLabel("结果会随输入自动更新；当前仍按单一物理量、各分量彼此独立的模型计算。")
-        footer_hint.setObjectName("infoPill")
-        footer_hint.setWordWrap(True)
+        self.project_mode_hint_label = QLabel()
+        self.project_mode_hint_label.setObjectName("infoPill")
+        self.project_mode_hint_label.setWordWrap(True)
         refresh_button = QPushButton("刷新计算")
         refresh_button.clicked.connect(self.refresh_calculation)
-        footer_row.addWidget(footer_hint, 1)
+        footer_row.addWidget(self.project_mode_hint_label, 1)
         footer_row.addWidget(refresh_button)
         project_layout.addLayout(footer_row)
 
         return project_group
+
+    def _build_measurement_workspace_page(self) -> QWidget:
+        panel = QWidget(self)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        workspace_splitter = QSplitter(Qt.Orientation.Vertical)
+        workspace_splitter.setChildrenCollapsible(False)
+        workspace_splitter.addWidget(self._build_measurements_group())
+        workspace_splitter.addWidget(self._build_b_sources_group())
+        workspace_splitter.setStretchFactor(0, 6)
+        workspace_splitter.setStretchFactor(1, 5)
+        layout.addWidget(workspace_splitter)
+        return panel
+
+    def _build_formula_workspace_page(self) -> QWidget:
+        panel = QWidget(self)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        workspace_group = QGroupBox("协同工作区")
+        workspace_layout = QVBoxLayout(workspace_group)
+
+        workspace_button_row = QHBoxLayout()
+        import_button = QPushButton("导入项目")
+        import_button.setObjectName("primaryButton")
+        import_button.clicked.connect(self.import_formula_projects)
+        remove_button = QPushButton("移除选中")
+        remove_button.clicked.connect(self.remove_selected_formula_projects)
+        refresh_button = QPushButton("刷新关联项目")
+        refresh_button.clicked.connect(self.refresh_formula_workspace)
+        workspace_button_row.addWidget(import_button)
+        workspace_button_row.addWidget(remove_button)
+        workspace_button_row.addWidget(refresh_button)
+        workspace_layout.addLayout(workspace_button_row)
+
+        self.formula_table = QTableWidget(0, 8)
+        self.formula_table.setHorizontalHeaderLabels(["符号", "测量量", "当前值", "uc", "U", "单位", "来源", "状态"])
+        self.formula_table.verticalHeader().setVisible(False)
+        self.formula_table.setAlternatingRowColors(True)
+        self.formula_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.formula_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.formula_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.formula_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.formula_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.formula_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.formula_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.formula_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self.formula_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+        self.formula_table.itemChanged.connect(self._on_formula_table_item_changed)
+        workspace_layout.addWidget(self.formula_table, 1)
+
+        self.formula_workspace_status_label = QLabel("尚未导入协同项目。")
+        self.formula_workspace_status_label.setObjectName("infoPill")
+        self.formula_workspace_status_label.setWordWrap(True)
+        workspace_layout.addWidget(self.formula_workspace_status_label)
+
+        formula_group = QGroupBox("表达式")
+        formula_layout = QVBoxLayout(formula_group)
+        formula_form = QFormLayout()
+        self.formula_expression_edit = QLineEdit()
+        self.formula_expression_edit.setPlaceholderText("例如：S = L * W")
+        self.formula_expression_edit.textChanged.connect(self._handle_user_edit)
+        formula_form.addRow("公式", self.formula_expression_edit)
+        formula_layout.addLayout(formula_form)
+
+        self.formula_expression_help_label = QLabel(
+            "支持 +、-、*、/、** 以及 sqrt、sin、cos、tan、exp、log、ln、abs、pow；默认假定各输入量彼此独立。"
+        )
+        self.formula_expression_help_label.setObjectName("infoPill")
+        self.formula_expression_help_label.setWordWrap(True)
+        formula_layout.addWidget(self.formula_expression_help_label)
+
+        self.formula_unit_hint_label = QLabel("输出单位留空时会尝试自动推导，例如 L * W -> cm^2。")
+        self.formula_unit_hint_label.setObjectName("infoPill")
+        self.formula_unit_hint_label.setWordWrap(True)
+        formula_layout.addWidget(self.formula_unit_hint_label)
+
+        layout.addWidget(workspace_group, 3)
+        layout.addWidget(formula_group, 2)
+        return panel
 
     def _build_measurements_group(self) -> QGroupBox:
         project_group = QGroupBox("原始数据")
@@ -487,6 +584,7 @@ class MainWindow(QMainWindow):
         metrics_layout.setColumnStretch(0, 0)
         metrics_layout.setColumnStretch(1, 1)
         self.metric_labels: dict[str, QLabel] = {}
+        self.metric_title_labels: dict[str, QLabel] = {}
         card_titles = [
             ("mean", "平均值 x̄"),
             ("ua", "A类标准不确定度 uA"),
@@ -504,6 +602,7 @@ class MainWindow(QMainWindow):
             value_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             metrics_layout.addWidget(title_label, row, 0)
             metrics_layout.addWidget(value_label, row, 1)
+            self.metric_title_labels[key] = title_label
             self.metric_labels[key] = value_label
 
         summary_layout.addWidget(metrics_panel)
@@ -565,14 +664,18 @@ class MainWindow(QMainWindow):
         self.current_project_path = project.project_path
         self._loading = True
 
+        self._set_project_mode(project.project_mode)
         self.quantity_name_edit.setText(project.quantity_name)
         self.unit_edit.setText(project.unit)
         self.coverage_factor_spin.setValue(project.coverage_factor or 2.0)
         self._set_result_decimal_places(project.result_decimal_places)
         self.notes_edit.setPlainText(project.notes)
+        self.formula_expression_edit.setText(project.formula_expression)
         self._populate_measurement_table(project.measured_values)
         self._populate_b_source_table(project.b_sources)
+        self._populate_formula_workspace_table(project.formula_variables)
         self._set_import_info(project.last_import_path)
+        self._apply_project_mode_ui()
 
         self._loading = False
         self.refresh_calculation(mark_dirty=False)
@@ -580,45 +683,55 @@ class MainWindow(QMainWindow):
         self._update_window_title()
 
     def collect_project_from_ui(self) -> ProjectData:
-        values = []
-        for row in range(self.measurement_table.rowCount()):
-            item = self.measurement_table.item(row, 0)
-            if item is None:
-                continue
-            parsed = self._parse_float(item.text(), default=None)
-            if parsed is not None:
-                values.append(parsed)
-
+        project_mode = self._selected_project_mode()
+        values: list[float] = []
         b_sources: list[BSource] = []
-        for row in range(self.b_table.rowCount()):
-            combo = self.b_table.cellWidget(row, 0)
-            if not isinstance(combo, QComboBox):
-                continue
-            source_type = str(combo.currentData())
-            name_item = self.b_table.item(row, 1)
-            value_item = self.b_table.item(row, 2)
-            divisor_item = self.b_table.item(row, 3)
-            notes_item = self.b_table.item(row, 4)
 
-            name = name_item.text().strip() if name_item else b_source_display_name(source_type)
-            value = self._parse_float(value_item.text() if value_item else "", 0.0)
-            divisor = self._parse_float(divisor_item.text() if divisor_item else "", default_divisor_for(source_type))
-            notes = notes_item.text().strip() if notes_item else ""
-            b_sources.append(
-                BSource(
-                    source_type=source_type,
-                    name=name or b_source_display_name(source_type),
-                    value=value,
-                    divisor=divisor,
-                    notes=notes,
+        if project_mode == ProjectMode.MEASUREMENT:
+            for row in range(self.measurement_table.rowCount()):
+                item = self.measurement_table.item(row, 0)
+                if item is None:
+                    continue
+                parsed = self._parse_float(item.text(), default=None)
+                if parsed is not None:
+                    values.append(parsed)
+
+            for row in range(self.b_table.rowCount()):
+                combo = self.b_table.cellWidget(row, 0)
+                if not isinstance(combo, QComboBox):
+                    continue
+                source_type = str(combo.currentData())
+                name_item = self.b_table.item(row, 1)
+                value_item = self.b_table.item(row, 2)
+                divisor_item = self.b_table.item(row, 3)
+                notes_item = self.b_table.item(row, 4)
+
+                name = name_item.text().strip() if name_item else b_source_display_name(source_type)
+                value = self._parse_float(value_item.text() if value_item else "", 0.0)
+                divisor = self._parse_float(divisor_item.text() if divisor_item else "", default_divisor_for(source_type))
+                notes = notes_item.text().strip() if notes_item else ""
+                b_sources.append(
+                    BSource(
+                        source_type=source_type,
+                        name=name or b_source_display_name(source_type),
+                        value=value,
+                        divisor=divisor,
+                        notes=notes,
+                    )
                 )
-            )
+
+        formula_expression = self.formula_expression_edit.text().strip()
+        inferred_name, _ = split_expression_assignment(formula_expression)
+        quantity_name = self.quantity_name_edit.text().strip() or (inferred_name if project_mode == ProjectMode.FORMULA else "")
 
         project = ProjectData(
-            quantity_name=self.quantity_name_edit.text().strip(),
+            project_mode=project_mode.value,
+            quantity_name=quantity_name,
             unit=self.unit_edit.text().strip(),
             measured_values=values,
             b_sources=b_sources,
+            formula_expression=formula_expression,
+            formula_variables=self._collect_formula_variables_from_ui() if project_mode == ProjectMode.FORMULA else [],
             coverage_factor=self.coverage_factor_spin.value(),
             result_decimal_places=self._selected_result_decimal_places(),
             notes=self.notes_edit.toPlainText().strip(),
@@ -707,6 +820,10 @@ class MainWindow(QMainWindow):
         return True
 
     def import_excel_measurements(self) -> None:
+        if self._selected_project_mode() != ProjectMode.MEASUREMENT:
+            QMessageBox.information(self, "当前为公式项目", "公式项目请使用“导入项目”将已有 .uncx 文件加入协同工作区。")
+            return
+
         path, _ = QFileDialog.getOpenFileName(
             self,
             "导入 Excel 测量数据",
@@ -909,6 +1026,75 @@ class MainWindow(QMainWindow):
             self.add_b_source_row()
         self._handle_user_edit()
 
+    def import_formula_projects(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "导入协同项目",
+            str(Path.cwd()),
+            "项目文件 (*.uncx);;JSON 文件 (*.json);;所有文件 (*)",
+        )
+        if not paths:
+            return
+
+        existing_symbols = {variable.symbol for variable in self.formula_workspace_variables if variable.symbol.strip()}
+        existing_paths = {
+            str(Path(variable.project_path).resolve())
+            for variable in self.formula_workspace_variables
+            if variable.project_path
+        }
+        skipped_messages: list[str] = []
+        added_count = 0
+
+        for path in paths:
+            normalized_path = str(Path(path).resolve())
+            if self.current_project_path and normalized_path == str(Path(self.current_project_path).resolve()):
+                skipped_messages.append(f"{Path(path).name}：不能将当前项目导入为自己的输入量。")
+                continue
+            if normalized_path in existing_paths:
+                skipped_messages.append(f"{Path(path).name}：已在当前协同工作区中。")
+                continue
+
+            try:
+                linked_project = load_project_file(path)
+            except Exception as exc:
+                skipped_messages.append(f"{Path(path).name}：{exc}")
+                continue
+
+            symbol = self._suggest_formula_symbol(linked_project.quantity_name or Path(path).stem, existing_symbols)
+            existing_symbols.add(symbol)
+            existing_paths.add(normalized_path)
+            self.formula_workspace_variables.append(
+                FormulaVariable(
+                    symbol=symbol,
+                    project_path=path,
+                    source_label=Path(path).name,
+                    quantity_name=linked_project.quantity_name,
+                    unit=linked_project.unit,
+                    project_snapshot=linked_project.to_dict(),
+                )
+            )
+            added_count += 1
+
+        self._populate_formula_workspace_table(self.formula_workspace_variables)
+        if added_count:
+            self._handle_user_edit()
+            self.statusBar().showMessage(f"已导入 {added_count} 个协同项目", 4000)
+        if skipped_messages:
+            QMessageBox.information(self, "部分项目未导入", "\n".join(skipped_messages))
+
+    def remove_selected_formula_projects(self) -> None:
+        selected_rows = sorted({index.row() for index in self.formula_table.selectionModel().selectedRows()}, reverse=True)
+        if not selected_rows:
+            return
+        for row in selected_rows:
+            if 0 <= row < len(self.formula_workspace_variables):
+                self.formula_workspace_variables.pop(row)
+        self._populate_formula_workspace_table(self.formula_workspace_variables)
+        self._handle_user_edit()
+
+    def refresh_formula_workspace(self) -> None:
+        self.refresh_calculation()
+
     def refresh_calculation(self, mark_dirty: bool = True) -> None:
         project = self.collect_project_from_ui()
         result = calculate_project(project)
@@ -940,9 +1126,9 @@ class MainWindow(QMainWindow):
             f"<b>{APP_DISPLAY_NAME}</b><br>"
             f"版本 {APP_VERSION}<br>"
             "作者: Leafuke<br><br>"
-            "用于物理实验课中单一物理量的不确定度计算。<br>"
-            "当前支持 A 类评定、B 类评定、合成标准不确定度、扩展不确定度，"
-            "并支持项目保存、Excel 导入、数据/结果 Excel 导出、TXT 导出和结果图片导出。<br><br>"
+            "用于物理实验课中单一测量项目与公式项目的不确定度计算。<br>"
+            "当前支持 A 类评定、B 类评定、协同工作区项目导入、表达式传播计算、"
+            "项目保存、Excel 导入、数据/结果 Excel 导出、TXT 导出和结果图片导出。<br><br>"
             f"本项目已按 {APP_LICENSE_NAME} 开源：<a href=\"{APP_REPOSITORY_URL}\">{APP_REPOSITORY_URL}</a>"
         )
         message_box.exec()
@@ -1010,6 +1196,22 @@ class MainWindow(QMainWindow):
         if item.column() == 5:
             return
         self._handle_user_edit()
+
+    def _on_formula_table_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._loading:
+            return
+        if item.column() != 0:
+            return
+        row = item.row()
+        if 0 <= row < len(self.formula_workspace_variables):
+            self.formula_workspace_variables[row].symbol = item.text().strip()
+        self._update_formula_workspace_labels()
+        self._handle_user_edit()
+
+    def _on_project_mode_changed(self) -> None:
+        self._apply_project_mode_ui()
+        if not self._loading:
+            self._handle_user_edit()
 
     def _on_b_source_type_changed(self) -> None:
         if self._loading:
@@ -1147,7 +1349,146 @@ class MainWindow(QMainWindow):
             item.setFlags((item.flags() | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled) & ~Qt.ItemFlag.ItemIsEditable)
         self.b_table.setItem(row, column, item)
 
+    def _collect_formula_variables_from_ui(self) -> list[FormulaVariable]:
+        self._loading = True
+        try:
+            for row in range(min(self.formula_table.rowCount(), len(self.formula_workspace_variables))):
+                item = self.formula_table.item(row, 0)
+                if item is not None:
+                    self.formula_workspace_variables[row].symbol = item.text().strip()
+        finally:
+            self._loading = False
+
+        collected_variables: list[FormulaVariable] = []
+        for variable in self.formula_workspace_variables:
+            symbol = variable.symbol.strip()
+            if not symbol:
+                continue
+
+            snapshot = dict(variable.project_snapshot)
+            quantity_name = variable.quantity_name
+            unit = variable.unit
+            source_label = variable.source_label or (Path(variable.project_path).name if variable.project_path else quantity_name)
+            if variable.project_path:
+                try:
+                    linked_project = load_project_file(variable.project_path)
+                    snapshot = linked_project.to_dict()
+                    quantity_name = linked_project.quantity_name
+                    unit = linked_project.unit
+                    source_label = Path(variable.project_path).name
+                except Exception:
+                    pass
+
+            collected_variables.append(
+                FormulaVariable(
+                    symbol=symbol,
+                    project_path=variable.project_path,
+                    source_label=source_label,
+                    quantity_name=quantity_name,
+                    unit=unit,
+                    project_snapshot=snapshot,
+                )
+            )
+
+        self.formula_workspace_variables = [FormulaVariable.from_dict(variable.to_dict()) for variable in collected_variables]
+        return collected_variables
+
+    def _populate_formula_workspace_table(self, variables: list[FormulaVariable], result: CalculationResult | None = None) -> None:
+        self.formula_workspace_variables = [FormulaVariable.from_dict(variable.to_dict()) for variable in variables]
+        runtime_variables = {}
+        if result is not None and result.project_mode == ProjectMode.FORMULA.value:
+            runtime_variables = {variable.symbol: variable for variable in result.formula_variables}
+
+        decimal_places = self._selected_result_decimal_places()
+        self._loading = True
+        self.formula_table.setRowCount(0)
+        for row, variable in enumerate(self.formula_workspace_variables):
+            runtime_variable = runtime_variables.get(variable.symbol)
+            self.formula_table.insertRow(row)
+            quantity_name = runtime_variable.quantity_name if runtime_variable else (variable.quantity_name or Path(variable.project_path).stem if variable.project_path else "未命名项目")
+            source_label = runtime_variable.source_label if runtime_variable else (variable.source_label or Path(variable.project_path).name if variable.project_path else "保存快照")
+            status_text = runtime_variable.status if runtime_variable else "等待计算"
+            self._set_formula_table_item(row, 0, variable.symbol, editable=True)
+            self._set_formula_table_item(row, 1, quantity_name)
+            self._set_formula_table_item(row, 2, format_number(runtime_variable.value, decimal_places) if runtime_variable else "--")
+            self._set_formula_table_item(row, 3, format_number(runtime_variable.standard_uncertainty, decimal_places) if runtime_variable else "--")
+            self._set_formula_table_item(row, 4, format_number(runtime_variable.expanded_uncertainty, decimal_places) if runtime_variable else "--")
+            self._set_formula_table_item(row, 5, runtime_variable.unit if runtime_variable else variable.unit)
+            self._set_formula_table_item(row, 6, source_label)
+            self._set_formula_table_item(row, 7, status_text)
+        self._loading = False
+        self._update_formula_workspace_labels(result)
+
+    def _set_formula_table_item(self, row: int, column: int, text: str, editable: bool = False) -> None:
+        item = QTableWidgetItem(text)
+        if column in (0, 2, 3, 4):
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        if not editable:
+            item.setFlags((item.flags() | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled) & ~Qt.ItemFlag.ItemIsEditable)
+        self.formula_table.setItem(row, column, item)
+
+    def _selected_project_mode(self) -> ProjectMode:
+        return ProjectMode.from_value(str(self.project_mode_combo.currentData()))
+
+    def _set_project_mode(self, project_mode: str) -> None:
+        target_index = self.project_mode_combo.findData(ProjectMode.from_value(project_mode).value)
+        if target_index < 0:
+            target_index = 0
+        self.project_mode_combo.setCurrentIndex(target_index)
+        self._apply_project_mode_ui()
+
+    def _apply_project_mode_ui(self) -> None:
+        project_mode = self._selected_project_mode()
+        is_measurement_mode = project_mode == ProjectMode.MEASUREMENT
+        self.workspace_stack.setCurrentIndex(0 if is_measurement_mode else 1)
+        self.import_excel_action.setEnabled(is_measurement_mode)
+        if is_measurement_mode:
+            self.project_mode_hint_label.setText("单一测量项目会根据重复测量与 B 类输入直接计算当前物理量的不确定度。")
+        else:
+            self.project_mode_hint_label.setText("公式项目会从协同工作区读取其他项目的结果，并按输入量独立的一阶传播公式计算新的不确定度。")
+        self._update_formula_workspace_labels(self.latest_result if self.latest_result.project_mode == ProjectMode.FORMULA.value else None)
+
+    def _update_formula_workspace_labels(self, result: CalculationResult | None = None) -> None:
+        symbols = [variable.symbol.strip() for variable in self.formula_workspace_variables if variable.symbol.strip()]
+        if symbols:
+            self.formula_workspace_status_label.setText(f"已导入 {len(symbols)} 个协同项目：{', '.join(symbols)}")
+            self.formula_expression_help_label.setText(
+                f"可用变量：{', '.join(symbols)}。支持 +、-、*、/、** 以及 sqrt、sin、cos、tan、exp、log、ln、abs、pow；默认假定各输入量彼此独立。"
+            )
+        else:
+            self.formula_workspace_status_label.setText("尚未导入协同项目。")
+            self.formula_expression_help_label.setText(
+                "支持 +、-、*、/、** 以及 sqrt、sin、cos、tan、exp、log、ln、abs、pow；默认假定各输入量彼此独立。"
+            )
+
+        manual_unit = self.unit_edit.text().strip()
+        if manual_unit:
+            self.formula_unit_hint_label.setText(f"当前结果单位采用手动指定值：{manual_unit}")
+        elif result is not None and result.project_mode == ProjectMode.FORMULA.value and result.resolved_unit:
+            self.formula_unit_hint_label.setText(f"当前结果单位自动推导为：{result.resolved_unit}")
+        else:
+            self.formula_unit_hint_label.setText("输出单位留空时会尝试自动推导，例如 L * W -> cm^2。")
+
+    def _suggest_formula_symbol(self, base_text: str, existing_symbols: set[str]) -> str:
+        candidates: list[str] = []
+        for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", base_text):
+            candidates.append(token)
+            if len(token) > 1:
+                candidates.append(token[0].upper())
+                candidates.append(token.upper())
+        for candidate in candidates:
+            if candidate and candidate not in existing_symbols:
+                return candidate
+        counter = 1
+        while True:
+            candidate = f"X{counter}"
+            if candidate not in existing_symbols:
+                return candidate
+            counter += 1
+
     def _update_b_standard_uncertainties(self, result: CalculationResult) -> None:
+        if self._selected_project_mode() != ProjectMode.MEASUREMENT:
+            return
         decimal_places = normalize_decimal_places(self.project.result_decimal_places)
         self._loading = True
         try:
@@ -1167,13 +1508,43 @@ class MainWindow(QMainWindow):
 
     def _update_summary_panel(self, project: ProjectData, result: CalculationResult) -> None:
         decimal_places = normalize_decimal_places(project.result_decimal_places)
-        unit_suffix = f" {project.unit}" if project.unit else ""
+        project_mode = ProjectMode.from_value(project.project_mode)
+        resolved_unit = result.resolved_unit or project.unit
+        unit_suffix = f" {resolved_unit}" if resolved_unit else ""
         rounded_value, rounded_uncertainty = rounded_measurement(
             result.mean,
             result.expanded_uncertainty,
             decimal_places,
         )
-        quantity_name = project.quantity_name or "测量量"
+        quantity_name = result.resolved_quantity_name or project.quantity_name or "测量量"
+
+        if project_mode == ProjectMode.FORMULA:
+            self.metric_title_labels["mean"].setText("结果值 y")
+            self.metric_title_labels["ua"].setText("输入量数量 n")
+            self.metric_title_labels["ub"].setText("主导输入量")
+            self.metric_title_labels["uc"].setText("合成标准不确定度 uc")
+            self.metric_title_labels["U"].setText("扩展不确定度 U")
+            self.result_headline.setText(f"{quantity_name} = ({rounded_value} ± {rounded_uncertainty}){unit_suffix}")
+            decimal_text = "自动修约" if decimal_places is None else f"固定 {decimal_places} 位小数"
+            expression_text = result.expression or project.formula_expression or "-"
+            self.result_subline.setText(
+                f"表达式: {expression_text}，覆盖因子 k = {format_number(result.coverage_factor)}，{decimal_text}，默认按输入量彼此独立传播。"
+            )
+            warning_text = "\n".join(result.warnings) if result.warnings else "当前公式项目输入有效，可直接导出为 Excel、TXT 或结果图片。"
+            self.warning_label.setText(warning_text)
+            self.metric_labels["mean"].setText(f"{format_number(result.mean, decimal_places)}{unit_suffix}")
+            self.metric_labels["ua"].setText(str(len(result.formula_variables)))
+            self.metric_labels["ub"].setText(result.dominant_component or "--")
+            self.metric_labels["uc"].setText(f"{format_number(result.combined_uncertainty, decimal_places)}{unit_suffix}")
+            self.metric_labels["U"].setText(f"{format_number(result.expanded_uncertainty, decimal_places)}{unit_suffix}")
+            self._populate_formula_workspace_table(self.formula_workspace_variables, result)
+            return
+
+        self.metric_title_labels["mean"].setText("平均值 x̄")
+        self.metric_title_labels["ua"].setText("A类标准不确定度 uA")
+        self.metric_title_labels["ub"].setText("B类合成标准不确定度 uB")
+        self.metric_title_labels["uc"].setText("合成标准不确定度 uc")
+        self.metric_title_labels["U"].setText("扩展不确定度 U")
         self.result_headline.setText(
             f"{quantity_name} = ({rounded_value} ± {rounded_uncertainty}){unit_suffix}"
         )
@@ -1388,9 +1759,16 @@ class MainWindow(QMainWindow):
         return clicked_button == discard_button
 
     def _default_file_stem(self) -> str:
-        base = self.quantity_name_edit.text().strip() or "不确定度项目"
+        base = self.quantity_name_edit.text().strip()
+        if not base and self._selected_project_mode() == ProjectMode.FORMULA:
+            base = self._inferred_formula_result_name()
+        base = base or "不确定度项目"
         cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", base)
         return cleaned
+
+    def _inferred_formula_result_name(self) -> str:
+        left_name, _ = split_expression_assignment(self.formula_expression_edit.text().strip())
+        return left_name.strip()
 
     def _parse_float(self, text: str, default: float | None = 0.0) -> float | None:
         cleaned = text.strip().replace("，", ".")

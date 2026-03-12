@@ -6,6 +6,18 @@ from math import sqrt
 from typing import Any
 
 
+class ProjectMode(str, Enum):
+    MEASUREMENT = "measurement"
+    FORMULA = "formula"
+
+    @classmethod
+    def from_value(cls, value: str) -> "ProjectMode":
+        try:
+            return cls(value)
+        except ValueError:
+            return cls.MEASUREMENT
+
+
 class BSourceType(str, Enum):
     RESOLUTION = "resolution"
     TOLERANCE = "tolerance"
@@ -34,6 +46,11 @@ DEFAULT_DIVISORS: dict[BSourceType, float] = {
     BSourceType.CUSTOM: sqrt(3),
 }
 
+PROJECT_MODE_DISPLAY_NAMES: dict[ProjectMode, str] = {
+    ProjectMode.MEASUREMENT: "单一测量项目",
+    ProjectMode.FORMULA: "公式项目",
+}
+
 
 def b_source_display_name(source_type: str) -> str:
     return B_SOURCE_DISPLAY_NAMES[BSourceType.from_value(source_type)]
@@ -41,6 +58,10 @@ def b_source_display_name(source_type: str) -> str:
 
 def default_divisor_for(source_type: str) -> float:
     return DEFAULT_DIVISORS[BSourceType.from_value(source_type)]
+
+
+def project_mode_display_name(project_mode: str) -> str:
+    return PROJECT_MODE_DISPLAY_NAMES[ProjectMode.from_value(project_mode)]
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -58,6 +79,41 @@ def _safe_optional_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return max(0, parsed)
+
+
+def _safe_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+@dataclass
+class FormulaVariable:
+    symbol: str = "X1"
+    project_path: str | None = None
+    source_label: str = ""
+    quantity_name: str = ""
+    unit: str = ""
+    project_snapshot: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "project_path": self.project_path,
+            "source_label": self.source_label,
+            "quantity_name": self.quantity_name,
+            "unit": self.unit,
+            "project_snapshot": self.project_snapshot,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "FormulaVariable":
+        return cls(
+            symbol=str(data.get("symbol", "X1")).strip() or "X1",
+            project_path=str(data.get("project_path", "")).strip() or None,
+            source_label=str(data.get("source_label", "")).strip(),
+            quantity_name=str(data.get("quantity_name", "")).strip(),
+            unit=str(data.get("unit", "")).strip(),
+            project_snapshot=_safe_dict(data.get("project_snapshot")),
+        )
 
 
 @dataclass
@@ -97,10 +153,13 @@ class BSource:
 
 @dataclass
 class ProjectData:
+    project_mode: str = ProjectMode.MEASUREMENT.value
     quantity_name: str = ""
     unit: str = ""
     measured_values: list[float] = field(default_factory=list)
     b_sources: list[BSource] = field(default_factory=list)
+    formula_expression: str = ""
+    formula_variables: list[FormulaVariable] = field(default_factory=list)
     coverage_factor: float = 2.0
     result_decimal_places: int | None = None
     notes: str = ""
@@ -110,6 +169,8 @@ class ProjectData:
     updated_at: str = ""
 
     def ensure_defaults(self) -> None:
+        if ProjectMode.from_value(self.project_mode) != ProjectMode.MEASUREMENT:
+            return
         if not self.b_sources:
             self.b_sources = [
                 BSource(
@@ -122,10 +183,13 @@ class ProjectData:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "project_mode": self.project_mode,
             "quantity_name": self.quantity_name,
             "unit": self.unit,
             "measured_values": self.measured_values,
             "b_sources": [source.to_dict() for source in self.b_sources],
+            "formula_expression": self.formula_expression,
+            "formula_variables": [variable.to_dict() for variable in self.formula_variables],
             "coverage_factor": self.coverage_factor,
             "result_decimal_places": self.result_decimal_places,
             "notes": self.notes,
@@ -137,10 +201,13 @@ class ProjectData:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProjectData":
         project = cls(
+            project_mode=ProjectMode.from_value(str(data.get("project_mode", ProjectMode.MEASUREMENT.value))).value,
             quantity_name=str(data.get("quantity_name", "")),
             unit=str(data.get("unit", "")),
             measured_values=[_safe_float(value) for value in data.get("measured_values", [])],
             b_sources=[BSource.from_dict(item) for item in data.get("b_sources", [])],
+            formula_expression=str(data.get("formula_expression", "")),
+            formula_variables=[FormulaVariable.from_dict(item) for item in data.get("formula_variables", [])],
             coverage_factor=_safe_float(data.get("coverage_factor", 2.0), 2.0),
             result_decimal_places=_safe_optional_int(data.get("result_decimal_places")),
             notes=str(data.get("notes", "")),

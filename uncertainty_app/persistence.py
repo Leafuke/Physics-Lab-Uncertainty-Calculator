@@ -58,7 +58,7 @@ def save_project_file(project: ProjectData, path: str) -> ProjectData:
     project.updated_at = now
 
     payload = {
-        "format_version": 1,
+        "format_version": 2,
         "project": project.to_dict(),
     }
 
@@ -73,7 +73,7 @@ def write_autosave(project: ProjectData) -> None:
     project.ensure_defaults()
     target = autosave_file_path()
     payload = {
-        "format_version": 1,
+        "format_version": 2,
         "project": project.to_dict(),
         "project_path": project.project_path,
     }

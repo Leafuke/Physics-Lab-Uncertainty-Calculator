@@ -7,8 +7,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from .calculations import CalculationResult, format_number, normalize_decimal_places, rounded_measurement
-from .models import ProjectData, b_source_display_name
+from .calculations import CalculationResult, calculate_project, format_number, normalize_decimal_places, rounded_measurement
+from .models import ProjectData, ProjectMode, b_source_display_name, project_mode_display_name
 
 KNOWN_VALUE_HEADERS = {
     "测量值",
@@ -46,18 +46,20 @@ def export_project_to_excel(project: ProjectData, result: CalculationResult, fil
     target.parent.mkdir(parents=True, exist_ok=True)
     workbook = _create_workbook("结果导出")
     result_number_format = _excel_number_format(project.result_decimal_places)
-    unit_suffix = f" {project.unit}" if project.unit else ""
+    unit_suffix = f" {result.resolved_unit}" if result.resolved_unit else ""
     rounded_value, rounded_uncertainty = rounded_measurement(
         result.mean,
         result.expanded_uncertainty,
         project.result_decimal_places,
     )
+    project_mode = ProjectMode.from_value(project.project_mode)
 
     overview_sheet = workbook.active
     overview_sheet.title = "项目概览"
     overview_rows = [
-        ("测量量", project.quantity_name or "未命名", None),
-        ("单位", project.unit or "-", None),
+        ("项目类型", project_mode_display_name(project.project_mode), None),
+        ("测量量", result.resolved_quantity_name or project.quantity_name or "未命名", None),
+        ("单位", result.resolved_unit or project.unit or "-", None),
         ("测量次数", result.sample_count, "0"),
         ("平均值", result.mean, result_number_format),
         ("A类标准不确定度", result.type_a_uncertainty, result_number_format),
@@ -72,37 +74,60 @@ def export_project_to_excel(project: ProjectData, result: CalculationResult, fil
         ),
         (
             "最终结果文本",
-            f"{project.quantity_name or '测量量'} = ({rounded_value} ± {rounded_uncertainty}){unit_suffix}, k = {format_number(result.coverage_factor)}",
+            f"{result.resolved_quantity_name or project.quantity_name or '测量量'} = ({rounded_value} ± {rounded_uncertainty}){unit_suffix}, k = {format_number(result.coverage_factor)}",
             None,
         ),
     ]
+    if project_mode == ProjectMode.FORMULA:
+        overview_rows.insert(3, ("表达式", result.expression or project.formula_expression or "-", None))
     _write_key_value_sheet(overview_sheet, overview_rows)
 
-    raw_values_sheet = workbook.create_sheet("原始数据")
-    _write_table_sheet(
-        raw_values_sheet,
-        ["序号", "测量值"],
-        [[index, value] for index, value in enumerate(project.measured_values, start=1)],
-        numeric_formats={1: "0", 2: _excel_number_format(None)},
-    )
-
-    b_sources_sheet = workbook.create_sheet("B类评定")
-    _write_table_sheet(
-        b_sources_sheet,
-        ["名称", "类型", "输入值", "分布因子", "标准不确定度", "说明"],
-        [
+    if project_mode == ProjectMode.FORMULA:
+        formula_sheet = workbook.create_sheet("协同工作区")
+        _write_table_sheet(
+            formula_sheet,
+            ["符号", "测量量", "当前值", "uc", "U", "单位", "来源", "状态"],
             [
-                component.name,
-                b_source_display_name(component.source_type),
-                component.input_value,
-                component.divisor,
-                component.standard_uncertainty,
-                component.note,
-            ]
-            for component in result.b_components
-        ],
-        numeric_formats={3: _excel_number_format(None), 4: "0.############", 5: result_number_format},
-    )
+                [
+                    variable.symbol,
+                    variable.quantity_name,
+                    variable.value,
+                    variable.standard_uncertainty,
+                    variable.expanded_uncertainty,
+                    variable.unit,
+                    variable.source_label,
+                    variable.status,
+                ]
+                for variable in result.formula_variables
+            ],
+            numeric_formats={3: result_number_format, 4: result_number_format, 5: result_number_format},
+        )
+    else:
+        raw_values_sheet = workbook.create_sheet("原始数据")
+        _write_table_sheet(
+            raw_values_sheet,
+            ["序号", "测量值"],
+            [[index, value] for index, value in enumerate(project.measured_values, start=1)],
+            numeric_formats={1: "0", 2: _excel_number_format(None)},
+        )
+
+        b_sources_sheet = workbook.create_sheet("B类评定")
+        _write_table_sheet(
+            b_sources_sheet,
+            ["名称", "类型", "输入值", "分布因子", "标准不确定度", "说明"],
+            [
+                [
+                    component.name,
+                    b_source_display_name(component.source_type),
+                    component.input_value,
+                    component.divisor,
+                    component.standard_uncertainty,
+                    component.note,
+                ]
+                for component in result.b_components
+            ],
+            numeric_formats={3: _excel_number_format(None), 4: "0.############", 5: result_number_format},
+        )
 
     process_sheet = workbook.create_sheet("计算过程")
     _write_table_sheet(
@@ -117,6 +142,7 @@ def export_project_to_excel(project: ProjectData, result: CalculationResult, fil
 
 
 def export_data_to_excel(project: ProjectData, file_path: str) -> None:
+    result = calculate_project(project)
     target = Path(file_path)
     target.parent.mkdir(parents=True, exist_ok=True)
 
@@ -124,43 +150,62 @@ def export_data_to_excel(project: ProjectData, file_path: str) -> None:
     info_sheet = workbook.active
     info_sheet.title = "项目数据"
     info_rows = [
-        ("测量量", project.quantity_name or "未命名", None),
-        ("单位", project.unit or "-", None),
+        ("项目类型", project_mode_display_name(project.project_mode), None),
+        ("测量量", result.resolved_quantity_name or project.quantity_name or "未命名", None),
+        ("单位", result.resolved_unit or project.unit or "-", None),
         ("覆盖因子 k", project.coverage_factor, "0.###"),
         (
             "结果保留小数位",
             "自动修约" if normalize_decimal_places(project.result_decimal_places) is None else f"{project.result_decimal_places} 位",
             None,
         ),
+        ("表达式", project.formula_expression or "-", None),
         ("最近导入来源", project.last_import_path or "-", None),
         ("备注", project.notes or "", None),
     ]
     _write_key_value_sheet(info_sheet, info_rows)
 
-    measurement_sheet = workbook.create_sheet("测量数据")
-    _write_table_sheet(
-        measurement_sheet,
-        ["序号", "测量值"],
-        [[index, value] for index, value in enumerate(project.measured_values, start=1)],
-        numeric_formats={1: "0", 2: _excel_number_format(None)},
-    )
-
-    b_sheet = workbook.create_sheet("B类输入")
-    _write_table_sheet(
-        b_sheet,
-        ["类型", "名称", "输入值", "分布因子", "备注"],
-        [
+    if ProjectMode.from_value(project.project_mode) == ProjectMode.FORMULA:
+        workspace_sheet = workbook.create_sheet("协同工作区")
+        _write_table_sheet(
+            workspace_sheet,
+            ["符号", "测量量", "单位", "来源项目", "来源路径"],
             [
-                b_source_display_name(source.source_type),
-                source.name,
-                source.value,
-                source.normalized_divisor(),
-                source.notes,
-            ]
-            for source in project.b_sources
-        ],
-        numeric_formats={3: _excel_number_format(None), 4: "0.############"},
-    )
+                [
+                    variable.symbol,
+                    variable.quantity_name,
+                    variable.unit,
+                    variable.source_label,
+                    variable.project_path or "",
+                ]
+                for variable in project.formula_variables
+            ],
+        )
+    else:
+        measurement_sheet = workbook.create_sheet("测量数据")
+        _write_table_sheet(
+            measurement_sheet,
+            ["序号", "测量值"],
+            [[index, value] for index, value in enumerate(project.measured_values, start=1)],
+            numeric_formats={1: "0", 2: _excel_number_format(None)},
+        )
+
+        b_sheet = workbook.create_sheet("B类输入")
+        _write_table_sheet(
+            b_sheet,
+            ["类型", "名称", "输入值", "分布因子", "备注"],
+            [
+                [
+                    b_source_display_name(source.source_type),
+                    source.name,
+                    source.value,
+                    source.normalized_divisor(),
+                    source.notes,
+                ]
+                for source in project.b_sources
+            ],
+            numeric_formats={3: _excel_number_format(None), 4: "0.############"},
+        )
 
     workbook.save(target)
 
