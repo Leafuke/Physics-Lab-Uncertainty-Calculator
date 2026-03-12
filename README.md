@@ -51,3 +51,13 @@ pyinstaller --noconfirm --windowed --name 物理实验不确定度计算工具 -
 ```
 
 打包完成后，可执行文件会出现在 `dist/物理实验不确定度计算工具/` 下。
+
+### GitHub Actions 自动发布
+
+仓库内置了三个手动触发的 GitHub Actions 工作流：
+
+- `.github/workflows/release-windows.yml`：构建 Windows 包，生成英文资产名的 zip，并创建或更新当前版本的 GitHub Release。
+- `.github/workflows/release-linux.yml`：构建 Linux 包，生成英文资产名的 7z，并上传到当前版本的 GitHub Release。
+- `.github/workflows/release-macos.yml`：使用 macOS ARM64 runner 构建 Apple Silicon 版本，生成英文资产名的 7z，并上传到当前版本的 GitHub Release。
+
+发布顺序建议先运行 Windows 工作流，再运行 Linux 和 macOS 工作流。Linux 和 macOS 工作流要求对应版本的 Release 已存在，否则会直接失败。

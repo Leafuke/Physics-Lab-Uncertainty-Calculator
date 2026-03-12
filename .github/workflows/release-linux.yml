@@ -44,7 +44,7 @@ jobs:
         env:
           APP_NAME: ${{ steps.meta.outputs.app_name }}
         run: |
-          pyinstaller --noconfirm --windowed --name "$APP_NAME" --icon assets/app.ico main.py
+          pyinstaller --clean --noconfirm --windowed --name "$APP_NAME" --icon assets/app.ico main.py
 
       - name: Package release archive
         id: package
@@ -59,6 +59,7 @@ jobs:
             --dist-dir "dist/$APP_NAME" \
             --icon-path "assets/app.ico" \
             --output-dir "release" \
+            --asset-prefix "uncertainty-calc" \
             --github-output "$GITHUB_OUTPUT"
 
       - name: Upload asset to existing release

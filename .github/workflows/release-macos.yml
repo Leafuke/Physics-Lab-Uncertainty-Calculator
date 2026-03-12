@@ -13,7 +13,7 @@ concurrency:
 jobs:
   upload:
     name: Build and Upload macOS Asset
-    runs-on: macos-13
+    runs-on: macos-14
     env:
       GH_TOKEN: ${{ github.token }}
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
@@ -44,7 +44,7 @@ jobs:
         env:
           APP_NAME: ${{ steps.meta.outputs.app_name }}
         run: |
-          pyinstaller --noconfirm --windowed --name "$APP_NAME" --icon assets/app.ico main.py
+          pyinstaller --clean --noconfirm --windowed --target-arch arm64 --name "$APP_NAME" --icon assets/app.ico main.py
 
       - name: Package release archive
         id: package
@@ -55,10 +55,11 @@ jobs:
           python .github/scripts/release_assets.py package \
             --root . \
             --platform macos \
-            --arch x64 \
+            --arch arm64 \
             --dist-dir "dist/$APP_NAME" \
             --icon-path "assets/app.ico" \
             --output-dir "release" \
+            --asset-prefix "uncertainty-calc" \
             --github-output "$GITHUB_OUTPUT"
 
       - name: Upload asset to existing release

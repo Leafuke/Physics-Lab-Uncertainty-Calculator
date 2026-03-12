@@ -45,7 +45,7 @@ jobs:
         env:
           APP_NAME: ${{ steps.meta.outputs.app_name }}
         run: |
-          pyinstaller --noconfirm --windowed --name "$env:APP_NAME" --icon assets/app.ico main.py
+          pyinstaller --clean --noconfirm --windowed --name "$env:APP_NAME" --icon assets/app.ico main.py
 
       - name: Package release archive
         id: package
@@ -60,6 +60,7 @@ jobs:
             --dist-dir "dist/$env:APP_NAME" `
             --icon-path "assets/app.ico" `
             --output-dir "release" `
+            --asset-prefix "uncertainty-calc" `
             --github-output "$env:GITHUB_OUTPUT"
 
       - name: Generate release notes

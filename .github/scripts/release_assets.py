@@ -2,19 +2,16 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib
 import shutil
 import textwrap
 import zipfile
 from pathlib import Path
 
-try:
-    import py7zr
-except ImportError:  # pragma: no cover - installed by workflow
-    py7zr = None
-
 
 METADATA_FILE = Path("uncertainty_app/__init__.py")
 REQUIRED_METADATA = {"APP_DISPLAY_NAME", "APP_VERSION"}
+DEFAULT_ASSET_PREFIX = "uncertainty-calc"
 
 
 def read_metadata(root: Path) -> dict[str, str]:
@@ -53,12 +50,12 @@ def write_github_output(output_path: Path, values: dict[str, str]) -> None:
 
 
 def resolve_bundle_dir(dist_dir: Path) -> tuple[Path, Path]:
-    if dist_dir.exists():
-        return dist_dir, dist_dir / "_internal"
-
     app_bundle = dist_dir.with_suffix(".app")
     if app_bundle.exists():
         return app_bundle, app_bundle / "Contents" / "Resources" / "_internal"
+
+    if dist_dir.exists():
+        return dist_dir, dist_dir / "_internal"
 
     raise FileNotFoundError(f"Bundled application directory not found: {dist_dir}")
 
@@ -71,13 +68,13 @@ def build_release_notes(app_name: str) -> str:
 
             - Windows：下载 Windows 压缩包（.zip），解压后双击 {app_name}.exe 运行。
             - Linux：下载 Linux 压缩包（.7z），解压后运行同目录下的 {app_name}。
-            - macOS：下载 macOS 压缩包（.7z），解压后运行同目录下的 {app_name}。
+            - macOS：下载 macOS ARM64 压缩包（.7z），适用于 Apple Silicon（M 系列）设备，解压后打开应用运行。
 
             使用说明：
             1. Windows 可直接用资源管理器解压 .zip。
-            2. Linux / macOS 可使用 7-Zip、Keka、The Unarchiver 或 p7zip 解压 .7z。
+            2. Linux / macOS 可直接解压 .7z。
             3. 解压后请保持主程序与 _internal 文件夹位于同一目录，再启动应用。
-            4. macOS 首次运行若被系统拦截，请在“系统设置 > 隐私与安全性”中允许运行；Apple Silicon 设备若提示安装 Rosetta，按系统提示完成即可。
+            4. macOS 首次运行若被系统拦截，请在“系统设置 > 隐私与安全性”中允许运行。
             """
         ).strip()
         + "\n"
@@ -91,6 +88,11 @@ def create_zip_archive(stage_dir: Path, archive_path: Path) -> None:
 
 
 def create_7z_archive(stage_dir: Path, archive_path: Path) -> None:
+    try:
+        py7zr = importlib.import_module("py7zr")
+    except ImportError as exc:  # pragma: no cover - installed by workflow
+        raise RuntimeError("py7zr is required to create .7z archives") from exc
+
     if py7zr is None:
         raise RuntimeError("py7zr is required to create .7z archives")
     with py7zr.SevenZipFile(archive_path, "w") as archive:
@@ -134,13 +136,25 @@ def command_package(args: argparse.Namespace) -> int:
     internal_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(icon_path, internal_dir / icon_path.name)
 
-    stage_name = f"{metadata['app_name']}-{metadata['tag']}-{args.platform.lower()}-{args.arch.lower()}"
+    asset_prefix = args.asset_prefix or DEFAULT_ASSET_PREFIX
+    stage_name = f"{asset_prefix}-{metadata['tag']}-{args.platform.lower()}-{args.arch.lower()}"
     stage_dir = output_dir / stage_name
     if stage_dir.exists():
         shutil.rmtree(stage_dir)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(bundle_dir, stage_dir, symlinks=True)
+    stage_dir.mkdir(parents=True, exist_ok=True)
+
+    if bundle_dir.suffix == ".app":
+        bundle_target = stage_dir / f"{asset_prefix}.app"
+        shutil.copytree(bundle_dir, bundle_target, symlinks=True)
+    else:
+        for child in bundle_dir.iterdir():
+            target = stage_dir / child.name
+            if child.is_dir():
+                shutil.copytree(child, target, symlinks=True)
+            else:
+                shutil.copy2(child, target)
 
     archive_extension = ".zip" if args.platform.lower() == "windows" else ".7z"
     archive_path = output_dir / f"{stage_name}{archive_extension}"
@@ -194,6 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
     package_parser.add_argument("--dist-dir", required=True)
     package_parser.add_argument("--icon-path", required=True)
     package_parser.add_argument("--output-dir", required=True)
+    package_parser.add_argument("--asset-prefix")
     package_parser.add_argument("--github-output")
     package_parser.set_defaults(func=command_package)
 
